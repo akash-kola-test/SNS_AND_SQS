@@ -1,0 +1,395 @@
+Mappings:
+  LogGroupConfigs:
+    ApplicationLogGroup:
+      Name: ApplicationLogs
+  PolicyDocumentConfigs:
+    Versions:
+      CurrentVersion: "2012-10-17"
+  AWSManagedPolicies:
+    AWSLambdaBasicExecutionRole:
+      Arn: "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+    AWSLambdaSQSQueueExecutionRole:
+      Arn: "arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole"
+
+Resources:
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !FindInMap [ LogGroupConfigs, ApplicationLogGroup, Name ]
+      RetentionInDays: 3
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: SNSBasicTopic
+  
+  SNSTopicInlinePolicy:
+    Type: AWS::SNS::TopicInlinePolicy
+    Properties:
+      TopicArn: !Ref SNSTopic
+      PolicyDocument:
+        Version: !FindInMap [ PolicyDocumentConfigs, Versions, CurrentVersion ]
+        Statement:
+          - Effect: Allow
+            Action: sns:Publish
+            Principal:
+              AWS: "*"
+            Resource: !Ref SNSTopic
+            Condition:
+              ArnEquals:
+                aws:SourceArn: "arn:aws:*:*:${AWS::AccountId}:*:*"
+
+  ProducerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ProducerExecutionRole
+      AssumeRolePolicyDocument: 
+        Version: !FindInMap [ PolicyDocumentConfigs, Versions, CurrentVersion ]
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: lambda.amazonaws.com
+      ManagedPolicyArns:
+        - !FindInMap [ AWSManagedPolicies, AWSLambdaBasicExecutionRole, Arn ]
+      Policies:
+        - PolicyName: PublishMessagePermission
+          PolicyDocument:
+            Version: !FindInMap [ PolicyDocumentConfigs, Versions, CurrentVersion ]
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref SNSTopic
+
+  ProducerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref SNSTopic
+      FunctionName: ProducerFunction
+      Handler: index.lambda_handler
+      LoggingConfig:
+        LogGroup: !FindInMap [ LogGroupConfigs, ApplicationLogGroup, Name ]
+      Role: !GetAtt ProducerExecutionRole.Arn
+      Runtime: "python3.12"
+      Timeout: 10
+      Code:
+        ZipFile: |
+          import logging
+          import os
+
+
+          import boto3
+
+
+          logger = logging.getLogger("producer lambda")
+          logger.setLevel(logging.INFO)
+
+
+          def lambda_handler(event, context):
+              TOPIC_ARN = os.getenv("TOPIC_ARN")
+              if TOPIC_ARN is None:
+                  logger.error("Topic Arn is not found")
+                  return {
+                      "statusCode": 500,
+                      "error": "Topic Arn is missing"
+                  }
+              
+              logger.info("Publishing message to the SNS topic")
+              sns_client = boto3.client("sns")
+              response = sns_client.publish(
+                      TopicArn=TOPIC_ARN,
+                      Subject="Test Subject",
+                      Message="Message from lambda producer"
+              )
+
+              logger.info("Send the message with Id of %s successfully to the topic", response.get("MessageId", ""))
+              return {
+                  "statusCode": 200,
+                  "body": {
+                      "message": "Published messge to Topic successfully"
+                  }
+              }
+
+  Queue1:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: Queue1
+  
+  Queue2:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: Queue2
+
+  Queue3:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: Queue3
+
+  QueueSendMessagePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref Queue1
+        - !Ref Queue2
+        - !Ref Queue3
+      PolicyDocument:
+        Version: !FindInMap [ PolicyDocumentConfigs, Versions, CurrentVersion ]
+        Statement:
+          - Effect: Allow
+            Action: sqs:SendMessage
+            Resource:
+              - !GetAtt Queue1.Arn
+              - !GetAtt Queue2.Arn
+              - !GetAtt Queue3.Arn
+            Principal:
+              Service: sns.amazonaws.com
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref SNSTopic
+
+  Queue1Subscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !GetAtt Queue1.Arn
+      Protocol: sqs
+      TopicArn: !Ref SNSTopic
+              
+  Queue2Subscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !GetAtt Queue2.Arn
+      Protocol: sqs
+      TopicArn: !Ref SNSTopic
+
+  Queue3Subscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !GetAtt Queue3.Arn
+      Protocol: sqs
+      TopicArn: !Ref SNSTopic
+
+  CommonConsumerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: !FindInMap [ PolicyDocumentConfigs, Versions, CurrentVersion ]
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: lambda.amazonaws.com
+      ManagedPolicyArns:
+        - !FindInMap [ AWSManagedPolicies, AWSLambdaBasicExecutionRole, Arn ]
+        - !FindInMap [ AWSManagedPolicies, AWSLambdaSQSQueueExecutionRole , Arn ]
+
+  Consumer1Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      Architectures:
+        - arm64
+      FunctionName: Consumer1Function
+      Handler: index.lambda_handler
+      LoggingConfig:
+        LogGroup: !FindInMap [ LogGroupConfigs, ApplicationLogGroup, Name ]
+      Role: !GetAtt CommonConsumerRole.Arn
+      Runtime: "python3.12"
+      Timeout: 10
+      Code:
+        ZipFile: | 
+          import logging
+          import json
+
+
+          logger = logging.getLogger("consumer 1")
+          logger.setLevel(logging.INFO)
+
+
+          def lambda_handler(event, context):
+              logger.info("Received event")
+              logger.info(event)
+
+              records = event.get("Records", [])
+
+              if len(records) == 0:
+                  logger.info("no records to process")
+                  return {
+                      "statusCode": 200,
+                      "body": {
+                          "message": "No records to process"
+                      }
+                  }
+              
+              logger.info("Received %d of records in event", len(records))
+              for record in records:
+                  logger.info("Processing record")
+                  logger.info(record)
+
+                  json_body = record.get("body", "")
+                  if len(json_body) == 0:
+                      logger.info("skipping the record as the body is empty")
+                      continue
+
+                  body = json.loads(json_body)
+
+                  
+                  logger.info("Subject is %s", body.get("Subject", ""))
+                  logger.info("Message is %s", body.get("Message", ""))
+
+              return {
+                  "statusCode": 200,
+                  "body": {
+                      "message": "Processed records successfully"
+                  }
+              }
+
+  Consumer2Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      Architectures:
+        - arm64
+      FunctionName: Consumer2Function
+      Handler: index.lambda_handler
+      LoggingConfig:
+        LogGroup: !FindInMap [ LogGroupConfigs, ApplicationLogGroup, Name ]
+      Role: !GetAtt CommonConsumerRole.Arn
+      Runtime: "python3.12"
+      Timeout: 10
+      Code:
+        ZipFile: |
+          import logging
+          import json
+
+
+          logger = logging.getLogger("consumer 2")
+          logger.setLevel(logging.INFO)
+
+
+          def lambda_handler(event, context):
+              logger.info("Received event")
+              logger.info(event)
+
+              records = event.get("Records", [])
+
+              if len(records) == 0:
+                  logger.info("no records to process")
+                  return {
+                      "statusCode": 200,
+                      "body": {
+                          "message": "No records to process"
+                      }
+                  }
+              
+              logger.info("Received %d of records in event", len(records))
+              for record in records:
+                  logger.info("Processing record")
+                  logger.info(record)
+
+                  json_body = record.get("body", "")
+                  if len(json_body) == 0:
+                      logger.info("skipping the record as the body is empty")
+                      continue
+
+                  body = json.loads(json_body)
+
+                  
+                  logger.info("Subject is %s", body.get("Subject", ""))
+                  logger.info("Message is %s", body.get("Message", ""))
+
+              return {
+                  "statusCode": 200,
+                  "body": {
+                      "message": "Processed records successfully"
+                  }
+              }
+
+  Consumer3Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      Architectures:
+        - arm64
+      FunctionName: Consumer3Function
+      Handler: index.lambda_handler
+      LoggingConfig:
+        LogGroup: !FindInMap [ LogGroupConfigs, ApplicationLogGroup, Name ]
+      Role: !GetAtt CommonConsumerRole.Arn
+      Runtime: "python3.12"
+      Timeout: 10
+      Code:
+        ZipFile: | 
+          import logging
+          import json
+
+
+          logger = logging.getLogger("consumer 3")
+          logger.setLevel(logging.INFO)
+
+
+          def lambda_handler(event, context):
+              logger.info("Received event")
+              logger.info(event)
+
+              records = event.get("Records", [])
+
+              if len(records) == 0:
+                  logger.info("no records to process")
+                  return {
+                      "statusCode": 200,
+                      "body": {
+                          "message": "No records to process"
+                      }
+                  }
+              
+              logger.info("Received %d of records in event", len(records))
+              for record in records:
+                  logger.info("Processing record")
+                  logger.info(record)
+
+                  json_body = record.get("body", "")
+                  if len(json_body) == 0:
+                      logger.info("skipping the record as the body is empty")
+                      continue
+
+                  body = json.loads(json_body)
+
+                  
+                  logger.info("Subject is %s", body.get("Subject", ""))
+                  logger.info("Message is %s", body.get("Message", ""))
+
+              return {
+                  "statusCode": 200,
+                  "body": {
+                      "message": "Processed records successfully"
+                  }
+              }
+
+  Consumer1EventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 3
+      Enabled: true
+      EventSourceArn: !GetAtt Queue1.Arn
+      FunctionName: !Ref Consumer1Function
+      MaximumBatchingWindowInSeconds: 10
+
+  Consumer2EventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 3
+      Enabled: true
+      EventSourceArn: !GetAtt Queue2.Arn
+      FunctionName: !Ref Consumer2Function
+      MaximumBatchingWindowInSeconds: 10
+
+  Consumer3EventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 3
+      Enabled: true
+      EventSourceArn: !GetAtt Queue3.Arn
+      FunctionName: !Ref Consumer3Function
+      MaximumBatchingWindowInSeconds: 10
+
